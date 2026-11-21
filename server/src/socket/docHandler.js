@@ -1,5 +1,12 @@
 const Document = require('../models/Document');
 const { apply, rebase } = require('../ot/transform');
+const validateOp = require('../utils/validateOp');
+
+// Agent secret is set in .env — agent-op events must carry it
+const AGENT_SECRET = process.env.AGENT_SECRET;
+
+// Max ops to keep in history (prune oldest when exceeded)
+const HISTORY_CAP = Document.LIMITS?.HISTORY_MAX ?? 50_000;
 
 /**
  * Attach all document-room socket events to `io`.
@@ -8,11 +15,11 @@ const { apply, rebase } = require('../ot/transform');
  *   join-doc   { docId }
  *   op         { docId, op: { type, position, text?, length?, version, clientId } }
  *   cursor     { docId, clientId, position }
- *   agent-op   { docId, op, baseVersion }   ← AI agent large rewrite (sent as one op or batched)
+ *   agent-op   { docId, op, baseVersion, secret }
  *
  * Server emits:
  *   doc-init   { doc: { _id, title, content, version } }
- *   op         { op, version }              ← rebased + applied op, broadcast to room
+ *   op         { op, version }
  *   cursor     { clientId, position }
  *   error      { message }
  */
@@ -21,107 +28,158 @@ module.exports = function attachDocHandler(io) {
     console.log(`[socket] connected: ${socket.id}`);
 
     // ── join-doc ──────────────────────────────────────────────────────────────
-    socket.on('join-doc', async ({ docId }) => {
+    socket.on('join-doc', async (payload) => {
       try {
-        // Find or create the document
-        let doc = await Document.findById(docId);
+        const docId = sanitizeId(payload?.docId);
+        if (!docId) return socket.emit('error', { message: 'Invalid docId.' });
+
+        let doc = await Document.findById(docId).select('-history'); // don't send history to client
         if (!doc) {
           doc = await Document.create({ _id: docId });
         }
 
-        // Leave any previous doc room (one doc per socket at a time)
-        if (socket.currentDocId) {
-          socket.leave(socket.currentDocId);
-        }
+        if (socket.currentDocId) socket.leave(socket.currentDocId);
         socket.currentDocId = docId;
         socket.join(docId);
 
         socket.emit('doc-init', {
-          doc: {
-            _id: doc._id,
-            title: doc.title,
-            content: doc.content,
-            version: doc.version,
-          },
+          doc: pick(doc, ['_id', 'title', 'content', 'version']),
         });
 
         console.log(`[socket] ${socket.id} joined doc ${docId}`);
       } catch (err) {
-        console.error('[join-doc]', err);
+        console.error('[join-doc]', err.message);
         socket.emit('error', { message: 'Could not load document.' });
       }
     });
 
     // ── op (human keystroke) ──────────────────────────────────────────────────
-    socket.on('op', async ({ docId, op }) => {
+    socket.on('op', async (payload) => {
       try {
+        const docId = sanitizeId(payload?.docId);
+        if (!docId) return socket.emit('error', { message: 'Invalid docId.' });
+
+        // Validate op shape before anything touches the DB
+        const check = validateOp(payload?.op);
+        if (!check.valid) {
+          return socket.emit('error', { message: `Bad op: ${check.reason}` });
+        }
+
+        const op = payload.op;
+
         const doc = await Document.findById(docId);
         if (!doc) return socket.emit('error', { message: 'Document not found.' });
 
-        // Rebase incoming op against any ops applied after op.version
-        const rebased = rebase(op, doc.history, op.version);
+        // Guard: version must not be ahead of the document
+        if (op.version > doc.version) {
+          return socket.emit('error', { message: 'op.version is ahead of document.' });
+        }
 
-        // Apply to canonical content
+        const rebased = rebase(op, doc.history, op.version);
         const newContent = apply(doc.content, rebased);
 
-        // Persist
+        // Reject if result exceeds content limit
+        if (newContent.length > Document.LIMITS.CONTENT_MAX) {
+          return socket.emit('error', { message: 'Document size limit exceeded.' });
+        }
+
         const newVersion = doc.version + 1;
         rebased.version = newVersion;
-        rebased.clientId = op.clientId;
+        rebased.clientId = op.clientId.trim();
 
-        await Document.findByIdAndUpdate(docId, {
+        // Build the update — prune oldest history entries if cap is exceeded
+        const historySize = doc.history.length;
+        const updateOp = {
           $set: { content: newContent, version: newVersion },
           $push: { history: rebased },
-        });
+        };
+        if (historySize >= HISTORY_CAP) {
+          // Remove oldest entry and add new one atomically
+          updateOp.$pop = { history: -1 };  // -1 removes from front
+        }
 
-        // Broadcast the rebased op to everyone in the room (including sender)
+        await Document.findByIdAndUpdate(docId, updateOp);
+
         io.to(docId).emit('op', { op: rebased, version: newVersion });
 
-        console.log(
-          `[op] doc=${docId} v${newVersion} ${rebased.type}@${rebased.position}`
-        );
+        console.log(`[op] doc=${docId} v${newVersion} ${rebased.type}@${rebased.position}`);
       } catch (err) {
-        console.error('[op]', err);
+        console.error('[op]', err.message);
         socket.emit('error', { message: 'Failed to apply op.' });
       }
     });
 
     // ── agent-op (AI large rewrite, arrives late) ─────────────────────────────
-    // The agent sends the op it computed at baseVersion.
-    // We rebase it against everything applied since, then apply normally.
-    // Human edits in the same range are preserved because OT shifts/trims the
-    // agent op around them rather than overwriting.
-    socket.on('agent-op', async ({ docId, op, baseVersion }) => {
+    socket.on('agent-op', async (payload) => {
       try {
+        // ── authenticate the agent ──────────────────────────────────────────
+        if (!AGENT_SECRET || payload?.secret !== AGENT_SECRET) {
+          return socket.emit('error', { message: 'Unauthorized agent-op.' });
+        }
+
+        const docId = sanitizeId(payload?.docId);
+        if (!docId) return socket.emit('error', { message: 'Invalid docId.' });
+
+        const check = validateOp(payload?.op);
+        if (!check.valid) {
+          return socket.emit('error', { message: `Bad agent op: ${check.reason}` });
+        }
+
+        const baseVersion = payload.baseVersion;
+        if (!Number.isInteger(baseVersion) || baseVersion < 0) {
+          return socket.emit('error', { message: 'Invalid baseVersion.' });
+        }
+
+        const op = payload.op;
+
         const doc = await Document.findById(docId);
         if (!doc) return socket.emit('error', { message: 'Document not found.' });
 
         const rebased = rebase(op, doc.history, baseVersion);
-
         const newContent = apply(doc.content, rebased);
+
+        if (newContent.length > Document.LIMITS.CONTENT_MAX) {
+          return socket.emit('error', { message: 'Document size limit exceeded.' });
+        }
+
         const newVersion = doc.version + 1;
         rebased.version = newVersion;
-        rebased.clientId = op.clientId || 'agent';
+        rebased.clientId = (op.clientId || 'agent').trim().slice(0, Document.LIMITS.CLIENT_ID_MAX);
 
-        await Document.findByIdAndUpdate(docId, {
+        const historySize = doc.history.length;
+        const updateOp = {
           $set: { content: newContent, version: newVersion },
           $push: { history: rebased },
-        });
+        };
+        if (historySize >= HISTORY_CAP) {
+          updateOp.$pop = { history: -1 };
+        }
+
+        await Document.findByIdAndUpdate(docId, updateOp);
 
         io.to(docId).emit('op', { op: rebased, version: newVersion });
 
-        console.log(
-          `[agent-op] doc=${docId} v${newVersion} rebased from base=${baseVersion}`
-        );
+        console.log(`[agent-op] doc=${docId} v${newVersion} rebased from base=${baseVersion}`);
       } catch (err) {
-        console.error('[agent-op]', err);
+        console.error('[agent-op]', err.message);
         socket.emit('error', { message: 'Failed to apply agent op.' });
       }
     });
 
     // ── cursor ────────────────────────────────────────────────────────────────
-    socket.on('cursor', ({ docId, clientId, position }) => {
-      // Broadcast to everyone else in the room
+    socket.on('cursor', (payload) => {
+      const docId = sanitizeId(payload?.docId);
+      if (!docId) return;
+
+      const clientId = typeof payload?.clientId === 'string'
+        ? payload.clientId.trim().slice(0, 128)
+        : null;
+      const position = Number.isInteger(payload?.position) && payload.position >= 0
+        ? payload.position
+        : null;
+
+      if (!clientId || position === null) return;
+
       socket.to(docId).emit('cursor', { clientId, position });
     });
 
@@ -131,3 +189,21 @@ module.exports = function attachDocHandler(io) {
     });
   });
 };
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+/** Allow only MongoDB ObjectId-looking strings or short alphanumeric ids */
+function sanitizeId(id) {
+  if (typeof id !== 'string') return null;
+  const trimmed = id.trim();
+  // Accept 24-char hex ObjectId OR alphanumeric slug up to 64 chars
+  if (/^[a-f0-9]{24}$/.test(trimmed) || /^[a-zA-Z0-9_-]{1,64}$/.test(trimmed)) {
+    return trimmed;
+  }
+  return null;
+}
+
+/** Return only the listed keys from an object */
+function pick(obj, keys) {
+  return keys.reduce((acc, k) => { acc[k] = obj[k]; return acc; }, {});
+}
