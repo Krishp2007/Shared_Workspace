@@ -21,7 +21,7 @@ function getClient() {
  * it directly against the original.
  */
 async function rewriteWithGemini(content, instruction) {
-  const model = getClient().getGenerativeModel({ model: 'gemini-1.5-flash' });
+  const model = getClient().getGenerativeModel({ model: 'gemini-2.5-flash' });
 
   const prompt = `You are a document editor assistant. The user has given you a document and an instruction.
 
