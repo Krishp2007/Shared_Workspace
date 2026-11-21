@@ -20,7 +20,7 @@ const opSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ['insert', 'delete'],
+      enum: ['insert', 'delete', 'replace'],
       required: true,
     },
     position: {

@@ -1,23 +1,19 @@
 /**
  * validateOp(op)
- *
  * Returns { valid: true } or { valid: false, reason: string }.
- * Call this before touching the DB with any op from an untrusted source.
  */
 
-const MAX_POSITION  = 2_000_000;   // matches CONTENT_MAX
+const MAX_POSITION  = 2_000_000;
 const MAX_LENGTH    = 2_000_000;
-const MAX_TEXT      = 100_000;     // matches TEXT_OP_MAX
+const MAX_TEXT      = 100_000;
 const MAX_CLIENT_ID = 128;
 
 function validateOp(op) {
-  if (!op || typeof op !== 'object') {
-    return fail('op must be an object');
-  }
+  if (!op || typeof op !== 'object') return fail('op must be an object');
 
   // ── type ──────────────────────────────────────────────────────────────────
-  if (op.type !== 'insert' && op.type !== 'delete') {
-    return fail(`op.type must be "insert" or "delete", got: ${op.type}`);
+  if (!['insert', 'delete', 'replace'].includes(op.type)) {
+    return fail(`op.type must be "insert", "delete", or "replace", got: ${op.type}`);
   }
 
   // ── position ──────────────────────────────────────────────────────────────
@@ -38,31 +34,39 @@ function validateOp(op) {
     return fail(`op.clientId must be ≤ ${MAX_CLIENT_ID} chars`);
   }
 
-  // ── insert-specific ───────────────────────────────────────────────────────
+  // ── insert ────────────────────────────────────────────────────────────────
   if (op.type === 'insert') {
-    if (typeof op.text !== 'string') {
-      return fail('insert op must have a string text field');
-    }
-    if (op.text.length === 0) {
-      return fail('insert op text must not be empty');
+    if (typeof op.text !== 'string' || op.text.length === 0) {
+      return fail('insert op must have a non-empty string text field');
     }
     if (op.text.length > MAX_TEXT) {
       return fail(`insert op text must be ≤ ${MAX_TEXT} chars`);
     }
   }
 
-  // ── delete-specific ───────────────────────────────────────────────────────
+  // ── delete ────────────────────────────────────────────────────────────────
   if (op.type === 'delete') {
     if (!Number.isInteger(op.length) || op.length <= 0 || op.length > MAX_LENGTH) {
       return fail(`delete op.length must be a positive integer ≤ ${MAX_LENGTH}`);
     }
   }
 
+  // ── replace ───────────────────────────────────────────────────────────────
+  if (op.type === 'replace') {
+    if (!Number.isInteger(op.length) || op.length <= 0 || op.length > MAX_LENGTH) {
+      return fail(`replace op.length must be a positive integer ≤ ${MAX_LENGTH}`);
+    }
+    if (typeof op.text !== 'string' || op.text.length === 0) {
+      return fail('replace op must have a non-empty string text field');
+    }
+    if (op.text.length > MAX_TEXT) {
+      return fail(`replace op text must be ≤ ${MAX_TEXT} chars`);
+    }
+  }
+
   return { valid: true };
 }
 
-function fail(reason) {
-  return { valid: false, reason };
-}
+function fail(reason) { return { valid: false, reason }; }
 
 module.exports = validateOp;

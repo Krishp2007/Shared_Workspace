@@ -1,38 +1,60 @@
 /**
  * Operational Transformation engine
  *
- * An "op" is:
- *   { type: 'insert', position, text }
- *   { type: 'delete', position, length }
+ * Op shapes:
+ *   { type: 'insert',  position, text }
+ *   { type: 'delete',  position, length }
+ *   { type: 'replace', position, length, text }   ← atomic replace (delete+insert)
  *
- * transform(incoming, concurrent)
- *   Returns a new op that produces the same logical change
- *   after `concurrent` has already been applied to the document.
- *
- * apply(content, op)
- *   Applies op to a string and returns the new string.
+ * transform(incoming, concurrent) → new op
+ * apply(content, op)              → new string
+ * rebase(incoming, log, baseVer)  → transformed op ready to apply at HEAD
  */
 
 function transform(incoming, concurrent) {
-  if (incoming.type === 'insert') {
-    return transformInsert(incoming, concurrent);
+  // Normalise replace → [delete, insert] pair for transform purposes,
+  // then re-wrap at the end.  This keeps the transform matrix small.
+  if (incoming.type === 'replace') {
+    return transformReplace(incoming, concurrent);
   }
-  if (incoming.type === 'delete') {
-    return transformDelete(incoming, concurrent);
+  if (concurrent.type === 'replace') {
+    // Treat concurrent replace as a delete followed by an insert
+    const asDel = { ...concurrent, type: 'delete' };
+    const asIns = { ...concurrent, type: 'insert', position: concurrent.position };
+    let op = transform(incoming, asDel);
+    op = transform(op, asIns);
+    return op;
   }
+
+  if (incoming.type === 'insert') return transformInsert(incoming, concurrent);
+  if (incoming.type === 'delete') return transformDelete(incoming, concurrent);
   throw new Error(`Unknown op type: ${incoming.type}`);
 }
 
-// --- insert vs insert / delete ---
+// ── replace vs anything ───────────────────────────────────────────────────────
+function transformReplace(rep, concurrent) {
+  // Transform replace as: transform its delete portion, then its insert portion
+  const asDel = { ...rep, type: 'delete' };
+  const transformedDel = transformDelete(asDel, concurrent);
 
+  // Insert rides at the same position as the (now-transformed) delete start
+  const asIns = { ...rep, type: 'insert', position: transformedDel.position };
+  const transformedIns = transformInsert(asIns, concurrent);
+
+  return {
+    ...rep,
+    position: transformedDel.position,
+    length:   transformedDel.length,
+    text:     transformedIns.text,  // text doesn't change, only position could
+  };
+}
+
+// ── insert vs insert / delete ─────────────────────────────────────────────────
 function transformInsert(ins, concurrent) {
   if (concurrent.type === 'insert') {
-    // If concurrent insert is before (or at same position, tie-break by clientId
-    // so both clients converge on the same order), shift our position right.
     if (
       concurrent.position < ins.position ||
-      (concurrent.position === ins.position &&
-        concurrent.clientId < ins.clientId)
+      (concurrent.position === ins.position && concurrent.clientId < ins.clientId)
     ) {
       return { ...ins, position: ins.position + concurrent.text.length };
     }
@@ -40,30 +62,24 @@ function transformInsert(ins, concurrent) {
   }
 
   if (concurrent.type === 'delete') {
-    // Concurrent delete is entirely before our insert
     if (concurrent.position + concurrent.length <= ins.position) {
       return { ...ins, position: ins.position - concurrent.length };
     }
-    // Concurrent delete starts at or after our insert position — no shift
     if (concurrent.position >= ins.position) {
       return ins;
     }
-    // Our insert is inside the deleted range — move to start of deletion
     return { ...ins, position: concurrent.position };
   }
 
   return ins;
 }
 
-// --- delete vs insert / delete ---
-
+// ── delete vs insert / delete ─────────────────────────────────────────────────
 function transformDelete(del, concurrent) {
   if (concurrent.type === 'insert') {
-    // Concurrent insert is before our delete range — shift right
     if (concurrent.position <= del.position) {
       return { ...del, position: del.position + concurrent.text.length };
     }
-    // Concurrent insert is inside our delete range — extend length
     if (concurrent.position < del.position + del.length) {
       return { ...del, length: del.length + concurrent.text.length };
     }
@@ -72,38 +88,25 @@ function transformDelete(del, concurrent) {
 
   if (concurrent.type === 'delete') {
     const aStart = concurrent.position;
-    const aEnd = concurrent.position + concurrent.length;
+    const aEnd   = concurrent.position + concurrent.length;
     const bStart = del.position;
-    const bEnd = del.position + del.length;
+    const bEnd   = del.position + del.length;
 
-    // Concurrent delete is entirely before ours
-    if (aEnd <= bStart) {
-      return { ...del, position: del.position - concurrent.length };
-    }
-    // Concurrent delete is entirely after ours
-    if (aStart >= bEnd) {
-      return del;
-    }
+    if (aEnd <= bStart) return { ...del, position: del.position - concurrent.length };
+    if (aStart >= bEnd) return del;
 
-    // Overlapping — trim our delete to cover only what concurrent didn't remove
-    const newStart = Math.min(bStart, aStart);
-    // Characters in our range that concurrent already deleted
-    const overlap = Math.min(bEnd, aEnd) - Math.max(bStart, aStart);
+    const newStart  = Math.min(bStart, aStart);
+    const overlap   = Math.min(bEnd, aEnd) - Math.max(bStart, aStart);
     const newLength = del.length - overlap;
 
-    if (newLength <= 0) {
-      // Everything we wanted to delete is already gone — no-op delete
-      return { ...del, position: newStart, length: 0 };
-    }
+    if (newLength <= 0) return { ...del, position: newStart, length: 0 };
     return { ...del, position: newStart, length: newLength };
   }
 
   return del;
 }
 
-/**
- * Apply an op to a string.  Returns the new string.
- */
+// ── apply ─────────────────────────────────────────────────────────────────────
 function apply(content, op) {
   if (op.type === 'insert') {
     const pos = Math.min(op.position, content.length);
@@ -114,20 +117,16 @@ function apply(content, op) {
     const len = Math.min(op.length, content.length - pos);
     return content.slice(0, pos) + content.slice(pos + len);
   }
+  if (op.type === 'replace') {
+    const pos = Math.min(op.position, content.length);
+    const len = Math.min(op.length, content.length - pos);
+    return content.slice(0, pos) + op.text + content.slice(pos + len);
+  }
   throw new Error(`Unknown op type: ${op.type}`);
 }
 
-/**
- * Rebase `incoming` on top of all ops in `log` that were applied
- * after the version the incoming op was based on.
- *
- * @param {object}   incoming  - the op to rebase
- * @param {object[]} log       - full history array from the Document model
- * @param {number}   baseVersion - version the incoming op was computed against
- * @returns {object} transformed op ready to apply at HEAD
- */
+// ── rebase ────────────────────────────────────────────────────────────────────
 function rebase(incoming, log, baseVersion) {
-  // Only transform against ops that were applied after baseVersion
   const concurrent = log.filter((o) => o.version > baseVersion);
   let op = { ...incoming };
   for (const c of concurrent) {

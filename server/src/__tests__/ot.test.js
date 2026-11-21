@@ -7,6 +7,9 @@ const ins = (position, text, clientId = 'A', version = 0) =>
 const del = (position, length, clientId = 'A', version = 0) =>
   ({ type: 'delete', position, length, clientId, version });
 
+const rep = (position, length, text, clientId = 'A', version = 0) =>
+  ({ type: 'replace', position, length, text, clientId, version });
+
 // ─── apply ────────────────────────────────────────────────────────────────────
 describe('apply', () => {
   test('insert at start', () => {
@@ -216,5 +219,112 @@ describe('rebase', () => {
     const rebasedInsert = rebase(agentInsert, historyWithDelete, 0);
     doc = apply(doc, rebasedInsert);
     expect(doc).toBe('Hello earth!'); // human "!" is preserved
+  });
+});
+
+// ─── replace op ───────────────────────────────────────────────────────────────
+describe('apply — replace', () => {
+  test('replace full word', () => {
+    // "HEY" → "hey"  (the original bug case)
+    expect(apply('HEY', rep(0, 3, 'hey'))).toBe('hey');
+  });
+
+  test('replace in middle', () => {
+    expect(apply('Hello World', rep(6, 5, 'Earth'))).toBe('Hello Earth');
+  });
+
+  test('replace at end', () => {
+    expect(apply('foobar', rep(3, 3, 'baz'))).toBe('foobaz');
+  });
+
+  test('replace clamped when past end', () => {
+    expect(apply('hi', rep(1, 999, 'ello'))).toBe('hello');
+  });
+});
+
+describe('transform — replace vs insert', () => {
+  test('concurrent insert before replace shifts replace right', () => {
+    // doc "HEY", A replaces pos 0 len 3 "hey", B inserts "XX" at pos 0
+    const a = rep(0, 3, 'hey', 'A');
+    const b = ins(0, 'XX', 'B');
+    const t = transform(a, b);
+    // After B: "XXHEY" — A's replace should now target pos 2 len 3
+    expect(t.position).toBe(2);
+    expect(t.length).toBe(3);
+    const afterB = apply('HEY', b);       // "XXHEY"
+    expect(apply(afterB, t)).toBe('XXhey');
+  });
+
+  test('concurrent insert after replace — no shift', () => {
+    const a = rep(0, 3, 'hey', 'A');
+    const b = ins(5, 'XX', 'B');
+    const t = transform(a, b);
+    expect(t.position).toBe(0);
+  });
+});
+
+describe('transform — replace vs delete', () => {
+  test('concurrent delete before replace shifts replace left', () => {
+    // doc "XXhello", delete "XX" (pos 0 len 2), replace "hello" (pos 2 len 5)
+    const a = rep(2, 5, 'world', 'A');
+    const b = del(0, 2, 'B');
+    const t = transform(a, b);
+    expect(t.position).toBe(0);
+    const afterB = apply('XXhello', b);     // "hello"
+    expect(apply(afterB, t)).toBe('world');
+  });
+});
+
+describe('the original bug — HEY → hey as atomic replace', () => {
+  test('single replace op produces correct result on remote client', () => {
+    // Client A has "HEY", sends replace(0, 3, "hey") at version 0
+    // Client B also has "HEY"
+    // Server applies replace → "hey" v1
+    // B receives replace op and applies it to "HEY" → "hey"
+    const docA = 'HEY';
+    const docB = 'HEY';
+    const replaceOp = rep(0, 3, 'hey', 'A', 0);
+
+    // Server side
+    const serverResult = apply(docA, replaceOp);
+    expect(serverResult).toBe('hey');
+
+    // Client B receives the same op
+    const clientBResult = apply(docB, replaceOp);
+    expect(clientBResult).toBe('hey');
+
+    // Both match — no "HyeEy" corruption
+    expect(serverResult).toBe(clientBResult);
+  });
+
+  test('replace + concurrent insert on same doc converges', () => {
+    // doc "HEY"
+    // A: replace(0,3,"hey") at v0 — lands first on server
+    // B: insert(3,"!") at v0 — concurrent, lands second
+    // Server applies A first → "hey" v1, then rebases B → insert at pos 3 → "hey!"
+    // Client A gets B's insert back → "hey" + insert(3,"!") → "hey!"
+    // Client B gets A's replace rebased over B's insert → same result
+
+    const docContent = 'HEY';
+    const replaceOp = rep(0, 3, 'hey', 'A', 0);
+    const insertOp  = ins(3, '!', 'B', 0);
+
+    // Server: apply replaceOp first
+    const afterReplace = apply(docContent, replaceOp);           // "hey"
+    const history = [{ ...replaceOp, version: 1 }];
+    const rebasedInsert = rebase(insertOp, history, 0);
+    const finalServer = apply(afterReplace, rebasedInsert);       // "hey!"
+
+    // Client A (sent replace, receives B's rebased insert)
+    const clientA = apply(apply(docContent, replaceOp), rebasedInsert);
+
+    // Client B (sent insert, receives A's replace rebased over B's insert)
+    const historyB = [{ ...insertOp, version: 1 }];
+    const rebasedReplace = rebase(replaceOp, historyB, 0);
+    const clientB = apply(apply(docContent, insertOp), rebasedReplace);
+
+    // All three must converge to the same string
+    expect(clientA).toBe(finalServer);
+    expect(clientB).toBe(finalServer);
   });
 });

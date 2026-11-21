@@ -113,6 +113,31 @@ describe('validateOp — delete', () => {
   });
 });
 
+// ─── replace-specific ────────────────────────────────────────────────────────
+describe('validateOp — replace', () => {
+  test('valid replace op', () => {
+    expect(validateOp({
+      type: 'replace', position: 0, length: 3, text: 'hey', clientId: 'u', version: 0,
+    })).toEqual({ valid: true });
+  });
+
+  test('replace missing length fails', () => {
+    expect(validateOp({ type: 'replace', position: 0, text: 'x', clientId: 'u', version: 0 }).valid).toBe(false);
+  });
+
+  test('replace missing text fails', () => {
+    expect(validateOp({ type: 'replace', position: 0, length: 3, clientId: 'u', version: 0 }).valid).toBe(false);
+  });
+
+  test('replace zero length fails', () => {
+    expect(validateOp({ type: 'replace', position: 0, length: 0, text: 'x', clientId: 'u', version: 0 }).valid).toBe(false);
+  });
+
+  test('replace empty text fails', () => {
+    expect(validateOp({ type: 'replace', position: 0, length: 3, text: '', clientId: 'u', version: 0 }).valid).toBe(false);
+  });
+});
+
 // ─── NoSQL injection attempts ─────────────────────────────────────────────────
 describe('validateOp — injection attempts', () => {
   test('$gt in position fails type check', () => {

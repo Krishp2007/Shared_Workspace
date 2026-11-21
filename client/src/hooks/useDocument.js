@@ -113,6 +113,11 @@ function applyOp(content, op) {
     const len = Math.min(op.length, content.length - pos);
     return content.slice(0, pos) + content.slice(pos + len);
   }
+  if (op.type === 'replace') {
+    const pos = Math.min(op.position, content.length);
+    const len = Math.min(op.length, content.length - pos);
+    return content.slice(0, pos) + op.text + content.slice(pos + len);
+  }
   return content;
 }
 
@@ -159,12 +164,9 @@ function diffToOp(oldStr, newStr, clientId, version) {
   const deletedLen  = oldSuffix - prefixLen;
   const insertedStr = newStr.slice(prefixLen, newSuffix);
 
-  // Replace: emit delete + insert so server sees two clean ops
+  // Replace: single atomic replace op — no race between delete and insert
   if (deletedLen > 0 && insertedStr.length > 0) {
-    return [
-      { type: 'delete', position: prefixLen, length: deletedLen, clientId, version },
-      { type: 'insert', position: prefixLen, text: insertedStr, clientId, version },
-    ];
+    return { type: 'replace', position: prefixLen, length: deletedLen, text: insertedStr, clientId, version };
   }
 
   if (deletedLen > 0) {
