@@ -88,9 +88,10 @@ router.patch('/:id/title', writeLimiter, async (req, res) => {
   }
 });
 
-// ─── POST /docs/:id/agent-rewrite — HTTP entry point for AI agent ops ─────────
-// The agent POSTs the op it computed at baseVersion along with its secret.
-// Server rebases + applies exactly like the socket agent-op event.
+// ─── POST /docs/:id/agent-rewrite ─────────────────────────────────────────────
+// Two modes:
+//   1. { instruction, baseVersion }  → server calls Gemini, builds op, applies
+//   2. { op, baseVersion }           → raw op path (scripts / tests)
 router.post('/:id/agent-rewrite', writeLimiter, async (req, res) => {
   try {
     // ── auth ───────────────────────────────────────────────────────────────
@@ -102,16 +103,13 @@ router.post('/:id/agent-rewrite', writeLimiter, async (req, res) => {
     const id = sanitizeId(req.params.id);
     if (!id) return res.status(400).json({ error: 'Invalid document id.' });
 
-    // ── validate op ────────────────────────────────────────────────────────
-    const { op, baseVersion } = req.body ?? {};
-    const check = validateOp(op);
-    if (!check.valid) return res.status(400).json({ error: `Bad op: ${check.reason}` });
+    const { op: rawOp, instruction, baseVersion } = req.body ?? {};
 
     if (!Number.isInteger(baseVersion) || baseVersion < 0) {
       return res.status(400).json({ error: 'baseVersion must be a non-negative integer.' });
     }
 
-    // agent-rewrite needs history for rebase, so load the full doc
+    // ── load doc ───────────────────────────────────────────────────────────
     const { apply, rebase } = require('../ot/transform');
     const doc = await Document.findById(id).lean();
     if (!doc) return res.status(404).json({ error: 'Document not found.' });
@@ -120,6 +118,37 @@ router.post('/:id/agent-rewrite', writeLimiter, async (req, res) => {
       return res.status(409).json({ error: 'baseVersion is ahead of document.' });
     }
 
+    // ── build op ───────────────────────────────────────────────────────────
+    let op;
+
+    if (instruction) {
+      // Gemini path: generate new text then build a replace op
+      if (typeof instruction !== 'string' || instruction.trim().length === 0) {
+        return res.status(400).json({ error: 'instruction must be a non-empty string.' });
+      }
+      if (instruction.length > 2000) {
+        return res.status(400).json({ error: 'instruction too long (max 2000 chars).' });
+      }
+
+      const { rewriteWithGemini } = require('../services/gemini');
+      const newText = await rewriteWithGemini(doc.content, instruction.trim());
+
+      op = {
+        type:     'replace',
+        position: 0,
+        length:   doc.content.length,
+        text:     newText,
+        clientId: 'gemini-agent',
+        version:  baseVersion,
+      };
+    } else {
+      // Raw op path
+      const check = validateOp(rawOp);
+      if (!check.valid) return res.status(400).json({ error: `Bad op: ${check.reason}` });
+      op = rawOp;
+    }
+
+    // ── rebase + apply ─────────────────────────────────────────────────────
     const rebased = rebase(op, doc.history, baseVersion);
     const newContent = apply(doc.content, rebased);
 
@@ -128,22 +157,28 @@ router.post('/:id/agent-rewrite', writeLimiter, async (req, res) => {
     }
 
     const newVersion = doc.version + 1;
-    rebased.version = newVersion;
+    rebased.version  = newVersion;
     rebased.clientId = (op.clientId || 'agent').trim().slice(0, 128);
 
     await Document.findByIdAndUpdate(id, {
-      $set: { content: newContent, version: newVersion },
-      $push: { history: rebased },
+      $set:  { content: newContent, version: newVersion },
+      $push: { history: { $each: [rebased], $slice: -50000 } },
     });
 
-    // Emit over socket so live editors see the change immediately
-    // The io instance is attached to app by index.js
     const io = req.app.get('io');
     if (io) io.to(id).emit('op', { op: rebased, version: newVersion });
 
+    console.log(`[agent-rewrite] doc=${id} v${newVersion} via ${instruction ? 'gemini' : 'raw-op'}`);
     return res.json({ version: newVersion, op: rebased });
   } catch (err) {
     console.error('[POST /docs/:id/agent-rewrite]', err.message);
+    // Surface Gemini-specific errors clearly
+    if (err.message?.includes('GEMINI_API_KEY')) {
+      return res.status(500).json({ error: 'Gemini API key not configured on server.' });
+    }
+    if (err.message?.includes('API_KEY_INVALID') || err.status === 400) {
+      return res.status(502).json({ error: 'Gemini API key is invalid.' });
+    }
     return res.status(500).json({ error: 'Could not apply agent rewrite.' });
   }
 });

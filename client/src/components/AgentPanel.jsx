@@ -1,98 +1,61 @@
 import { useState } from 'react';
-import { agentRewrite } from '../api/docsApi';
+
+const SUGGESTIONS = [
+  'Fix grammar and spelling',
+  'Make it more concise',
+  'Rewrite in a formal tone',
+  'Rewrite in a casual tone',
+  'Summarise in 3 bullet points',
+  'Expand with more detail',
+  'Translate to Spanish',
+];
 
 /**
  * AgentPanel
  *
  * Props:
- *   docId       — current document id
- *   content     — current canonical content (used to build the replace op)
- *   version     — current doc version (sent as baseVersion)
- *   onApplied   — called with { version } after the agent op lands
- *   onError     — called with error message string
+ *   docId     — current document id
+ *   version   — current doc version (sent as baseVersion so server can rebase)
+ *   onError   — called with error message string
  */
-export default function AgentPanel({ docId, content, version, onApplied, onError }) {
-  const [open, setOpen]       = useState(false);
+export default function AgentPanel({ docId, version, onError }) {
+  const [open, setOpen]             = useState(false);
   const [instruction, setInstruction] = useState('');
-  const [status, setStatus]   = useState('idle'); // idle | thinking | done | error
-
-  // ── The "agent" for the demo ──────────────────────────────────────────────
-  // Real production: call an LLM API here, get back new text, build the op.
-  // Demo: runs a set of deterministic text transforms locally so the UI
-  // works end-to-end without an LLM key.
-  function runAgentLocally(text, instruction) {
-    const cmd = instruction.trim().toLowerCase();
-
-    if (cmd.includes('uppercase') || cmd.includes('upper case')) {
-      return text.toUpperCase();
-    }
-    if (cmd.includes('lowercase') || cmd.includes('lower case')) {
-      return text.toLowerCase();
-    }
-    if (cmd.includes('reverse')) {
-      return text.split('').reverse().join('');
-    }
-    if (cmd.startsWith('prepend ') || cmd.startsWith('prefix ')) {
-      const prefix = instruction.trim().split(' ').slice(1).join(' ');
-      return prefix + '\n' + text;
-    }
-    if (cmd.startsWith('append ') || cmd.startsWith('suffix ')) {
-      const suffix = instruction.trim().split(' ').slice(1).join(' ');
-      return text + '\n' + suffix;
-    }
-    if (cmd.includes('remove blank') || cmd.includes('remove empty')) {
-      return text.split('\n').filter(l => l.trim() !== '').join('\n');
-    }
-    if (cmd.includes('title case')) {
-      return text.replace(/\w\S*/g, w => w[0].toUpperCase() + w.slice(1).toLowerCase());
-    }
-    if (cmd.startsWith('replace ')) {
-      // "replace foo with bar"
-      const match = instruction.match(/replace (.+?) with (.+)/i);
-      if (match) return text.split(match[1]).join(match[2]);
-    }
-    // Default: wrap with a note
-    return `[Agent: "${instruction}"]\n${text}`;
-  }
+  const [status, setStatus]         = useState('idle'); // idle | thinking | done | error
+  const [statusMsg, setStatusMsg]   = useState('');
 
   async function handleSubmit(e) {
     e.preventDefault();
-    if (!instruction.trim() || !content) return;
+    const trimmed = instruction.trim();
+    if (!trimmed) return;
 
     setStatus('thinking');
-
-    // Simulate agent "thinking" delay (300ms)
-    await new Promise(r => setTimeout(r, 300));
+    setStatusMsg('Gemini is thinking…');
 
     try {
-      const newText = runAgentLocally(content, instruction);
+      const secret = import.meta.env.VITE_AGENT_SECRET || 'change_this_before_deploy';
 
-      if (newText === content) {
-        setStatus('idle');
-        return;
-      }
+      const res = await fetch(`/docs/${docId}/agent-rewrite`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-agent-secret': secret,
+        },
+        body: JSON.stringify({ instruction: trimmed, baseVersion: version }),
+      });
 
-      // Build a single replace op covering the entire document
-      const op = {
-        type:      'replace',
-        position:  0,
-        length:    content.length,
-        text:      newText,
-        clientId:  'agent-ui',
-        version,
-      };
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
-      const result = await agentRewrite(docId, op, version);
       setStatus('done');
+      setStatusMsg('Done ✓');
       setInstruction('');
-      onApplied?.(result);
-
-      // Reset done state after 2s
-      setTimeout(() => setStatus('idle'), 2000);
+      setTimeout(() => { setStatus('idle'); setStatusMsg(''); }, 2500);
     } catch (err) {
       setStatus('error');
+      setStatusMsg(err.message);
       onError?.(err.message);
-      setTimeout(() => setStatus('idle'), 3000);
+      setTimeout(() => { setStatus('idle'); setStatusMsg(''); }, 4000);
     }
   }
 
@@ -101,29 +64,54 @@ export default function AgentPanel({ docId, content, version, onApplied, onError
       <button
         className="agent-toggle"
         onClick={() => setOpen(v => !v)}
-        title="AI Agent"
+        title="AI Agent (Gemini)"
       >
-        ⚡ Agent {open ? '▲' : '▼'}
+        ✦ Agent {open ? '▲' : '▼'}
       </button>
 
       {open && (
-        <form className="agent-form" onSubmit={handleSubmit}>
-          <input
-            className="agent-input"
-            placeholder='e.g. "uppercase", "replace hello with hi", "title case"'
-            value={instruction}
-            onChange={e => setInstruction(e.target.value)}
-            disabled={status === 'thinking'}
-            autoFocus
-          />
-          <button
-            type="submit"
-            className="agent-run-btn"
-            disabled={status === 'thinking' || !instruction.trim()}
-          >
-            {status === 'thinking' ? '…' : status === 'done' ? '✓' : 'Run'}
-          </button>
-        </form>
+        <div className="agent-dropdown">
+          <form className="agent-form" onSubmit={handleSubmit}>
+            <input
+              className="agent-input"
+              placeholder="Instruction for Gemini…"
+              value={instruction}
+              onChange={e => setInstruction(e.target.value)}
+              disabled={status === 'thinking'}
+              autoFocus
+            />
+            <button
+              type="submit"
+              className={`agent-run-btn ${status}`}
+              disabled={status === 'thinking' || !instruction.trim()}
+            >
+              {status === 'thinking' ? '…' : status === 'done' ? '✓' : 'Run'}
+            </button>
+          </form>
+
+          {/* Quick suggestion chips */}
+          {status === 'idle' && (
+            <div className="agent-suggestions">
+              {SUGGESTIONS.map(s => (
+                <button
+                  key={s}
+                  className="agent-chip"
+                  type="button"
+                  onClick={() => setInstruction(s)}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Status message */}
+          {statusMsg && (
+            <p className={`agent-status-msg agent-status-${status}`}>
+              {statusMsg}
+            </p>
+          )}
+        </div>
       )}
     </div>
   );
