@@ -45,19 +45,27 @@ export function useDocument() {
     setContent((prev) => applyOp(prev, op));
   }, []);
 
-  // ── Build an op from a textarea change event ───────────────────────────────
-  // Returns the op (caller passes it to sendOp).
+  // ── Build op(s) from a textarea change event ──────────────────────────────
+  // Returns an array of ops (usually 1, two for a replace).
+  // Caller sends each op to the server in order.
   const buildOpFromChange = useCallback(
     (oldContent, newContent, clientId, currentVersion) => {
-      const op = diffToOp(oldContent, newContent, clientId, currentVersion);
-      if (!op) return null;
-      // Optimistically update local state immediately (no waiting for server)
+      const result = diffToOp(oldContent, newContent, clientId, currentVersion);
+      if (!result) return [];
+      const ops = Array.isArray(result) ? result : [result];
+      // Optimistically update local state immediately
       setContent(newContent);
-      pendingOpsRef.current.push(op);
-      return op;
+      pendingOpsRef.current.push(...ops);
+      return ops;
     },
     []
   );
+
+  // ── Called when server acks our own op (op-ack) ───────────────────────────
+  // Just sync the version number — content already applied optimistically.
+  const handleAck = useCallback(({ version: newVersion }) => {
+    setVersion(newVersion);
+  }, []);
 
   const setLoading = useCallback(() => setStatus('loading'), []);
   const setConnected = useCallback(() => setStatus('connected'), []);
@@ -75,6 +83,7 @@ export function useDocument() {
     error,
     handleInit,
     handleRemoteOp,
+    handleAck,
     buildOpFromChange,
     setLoading,
     setConnected,
@@ -135,16 +144,28 @@ function diffToOp(oldStr, newStr, clientId, version) {
   const insertedStr = newStr.slice(prefixLen, newSuffix); // chars added in new
 
   if (deletedLen > 0 && insertedStr.length > 0) {
-    // Replace = delete then insert. We model this as a delete; the insert
-    // will come through on the next keystroke diff if needed.
-    // For single-char replaces (autocorrect, etc.) emit delete first.
-    return {
-      type: 'delete',
-      position: prefixLen,
-      length: deletedLen,
-      clientId,
-      version,
-    };
+    // Replace = delete + insert. Emit delete now; the insertion will be
+    // picked up in the next diff cycle automatically because React sets
+    // the value after each onChange, so the next event sees old=afterDelete.
+    // We also emit the insert immediately as a second op so single-event
+    // replacements (paste, autocorrect) work correctly.
+    // Return an array; caller must send both.
+    return [
+      {
+        type: 'delete',
+        position: prefixLen,
+        length: deletedLen,
+        clientId,
+        version,
+      },
+      {
+        type: 'insert',
+        position: prefixLen,
+        text: insertedStr,
+        clientId,
+        version, // server will rebase the insert against the delete
+      },
+    ];
   }
 
   if (deletedLen > 0) {

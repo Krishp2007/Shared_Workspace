@@ -87,20 +87,25 @@ module.exports = function attachDocHandler(io) {
         rebased.version = newVersion;
         rebased.clientId = op.clientId.trim();
 
-        // Build the update — prune oldest history entries if cap is exceeded
-        const historySize = doc.history.length;
+        // Build the update — cap history with $slice so we never exceed HISTORY_CAP.
+        // $push + $each + $slice is a single atomic Mongo operation.
         const updateOp = {
           $set: { content: newContent, version: newVersion },
-          $push: { history: rebased },
+          $push: {
+            history: {
+              $each: [rebased],
+              $slice: -HISTORY_CAP,   // keep the HISTORY_CAP most-recent ops
+            },
+          },
         };
-        if (historySize >= HISTORY_CAP) {
-          // Remove oldest entry and add new one atomically
-          updateOp.$pop = { history: -1 };  // -1 removes from front
-        }
 
         await Document.findByIdAndUpdate(docId, updateOp);
 
-        io.to(docId).emit('op', { op: rebased, version: newVersion });
+        // Broadcast to everyone in the room EXCEPT the sender.
+        // The sender already applied the op optimistically on their side.
+        socket.to(docId).emit('op', { op: rebased, version: newVersion });
+        // Send ack back to sender so they can update their local version number.
+        socket.emit('op-ack', { version: newVersion });
 
         console.log(`[op] doc=${docId} v${newVersion} ${rebased.type}@${rebased.position}`);
       } catch (err) {
@@ -146,17 +151,19 @@ module.exports = function attachDocHandler(io) {
         rebased.version = newVersion;
         rebased.clientId = (op.clientId || 'agent').trim().slice(0, Document.LIMITS.CLIENT_ID_MAX);
 
-        const historySize = doc.history.length;
         const updateOp = {
           $set: { content: newContent, version: newVersion },
-          $push: { history: rebased },
+          $push: {
+            history: {
+              $each: [rebased],
+              $slice: -HISTORY_CAP,
+            },
+          },
         };
-        if (historySize >= HISTORY_CAP) {
-          updateOp.$pop = { history: -1 };
-        }
 
         await Document.findByIdAndUpdate(docId, updateOp);
 
+        // Agent ops broadcast to everyone including the caller
         io.to(docId).emit('op', { op: rebased, version: newVersion });
 
         console.log(`[agent-op] doc=${docId} v${newVersion} rebased from base=${baseVersion}`);

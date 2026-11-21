@@ -12,19 +12,20 @@ const SOCKET_URL = 'http://localhost:4000';
  * The socket connects once and joins the room for `docId`.
  * Cleans up on unmount or when docId changes.
  */
-export function useSocket(docId, { onInit, onOp, onCursor, onError } = {}) {
+export function useSocket(docId, { onInit, onOp, onCursor, onError, onAck } = {}) {
   const socketRef = useRef(null);
 
-  // Keep callbacks in refs so event handlers never go stale
   const onInitRef    = useRef(onInit);
   const onOpRef      = useRef(onOp);
   const onCursorRef  = useRef(onCursor);
   const onErrorRef   = useRef(onError);
+  const onAckRef     = useRef(onAck);
 
   useEffect(() => { onInitRef.current   = onInit;   }, [onInit]);
   useEffect(() => { onOpRef.current     = onOp;     }, [onOp]);
   useEffect(() => { onCursorRef.current = onCursor; }, [onCursor]);
   useEffect(() => { onErrorRef.current  = onError;  }, [onError]);
+  useEffect(() => { onAckRef.current    = onAck;    }, [onAck]);
 
   useEffect(() => {
     if (!docId) return;
@@ -41,6 +42,7 @@ export function useSocket(docId, { onInit, onOp, onCursor, onError } = {}) {
 
     socket.on('doc-init', (payload) => onInitRef.current?.(payload));
     socket.on('op',       (payload) => onOpRef.current?.(payload));
+    socket.on('op-ack',   (payload) => onAckRef.current?.(payload));
     socket.on('cursor',   (payload) => onCursorRef.current?.(payload));
     socket.on('error',    (payload) => onErrorRef.current?.(payload));
 

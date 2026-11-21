@@ -15,7 +15,7 @@ export default function Editor({ docId, clientId, onBack }) {
   const {
     content, version, title, setTitle,
     status, error,
-    handleInit, handleRemoteOp, buildOpFromChange,
+    handleInit, handleRemoteOp, handleAck, buildOpFromChange,
     setLoading, handleError,
   } = useDocument();
 
@@ -42,6 +42,7 @@ export default function Editor({ docId, clientId, onBack }) {
   const { sendOp, sendCursor } = useSocket(docId, {
     onInit:   handleInit,
     onOp:     handleRemoteOp,
+    onAck:    handleAck,
     onCursor: handleCursor,
     onError:  handleError,
   });
@@ -52,13 +53,14 @@ export default function Editor({ docId, clientId, onBack }) {
   // ── Textarea change → op ────────────────────────────────────────────────────
   const handleChange = useCallback((e) => {
     const newContent = e.target.value;
-    const op = buildOpFromChange(
+    const ops = buildOpFromChange(
       contentRef.current,
       newContent,
       clientId,
       versionRef.current
     );
-    if (op) sendOp(op);
+    // Send each op in order (usually 1, two for a replace/paste)
+    ops.forEach((op) => sendOp(op));
   }, [buildOpFromChange, clientId, sendOp]);
 
   // ── Cursor position → broadcast ─────────────────────────────────────────────
