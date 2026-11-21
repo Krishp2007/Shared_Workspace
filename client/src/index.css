@@ -218,3 +218,59 @@ body {
 
 /* ── Misc ─────────────────────────────────────────────────────────────────── */
 .loading-text, .empty-text { color: #475569; padding: 1rem 0; }
+
+/* ── Agent Panel ──────────────────────────────────────────────────────────── */
+.agent-panel {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+.agent-toggle {
+  background: #1e2130;
+  border: 1px solid #4f46e5;
+  color: #a5b4fc;
+  border-radius: 6px;
+  padding: 0.3rem 0.75rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+.agent-toggle:hover { background: #2d2f55; }
+
+.agent-form {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.agent-input {
+  width: 260px;
+  padding: 0.3rem 0.6rem;
+  background: #0f1117;
+  border: 1px solid #4f46e5;
+  border-radius: 6px;
+  color: #e2e8f0;
+  font-size: 0.82rem;
+  outline: none;
+}
+.agent-input:focus { border-color: #818cf8; }
+.agent-input:disabled { opacity: 0.5; }
+
+.agent-run-btn {
+  background: #4f46e5;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 0.3rem 0.8rem;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s;
+  min-width: 2.5rem;
+}
+.agent-run-btn:hover:not(:disabled) { background: #4338ca; }
+.agent-run-btn:disabled { opacity: 0.5; cursor: not-allowed; }

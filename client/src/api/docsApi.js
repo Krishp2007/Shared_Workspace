@@ -7,9 +7,7 @@ async function handleResponse(res) {
 }
 
 export async function listDocs({ limit = 20, skip = 0 } = {}) {
-  return handleResponse(
-    await fetch(`${BASE}?limit=${limit}&skip=${skip}`)
-  );
+  return handleResponse(await fetch(`${BASE}?limit=${limit}&skip=${skip}`));
 }
 
 export async function getDoc(id) {
@@ -32,6 +30,21 @@ export async function renameDoc(id, title) {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title }),
+    })
+  );
+}
+
+export async function agentRewrite(docId, op, baseVersion) {
+  // Secret read from .env — never hardcoded in real production
+  const secret = import.meta.env.VITE_AGENT_SECRET || 'change_this_before_deploy';
+  return handleResponse(
+    await fetch(`${BASE}/${docId}/agent-rewrite`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-agent-secret': secret,
+      },
+      body: JSON.stringify({ op, baseVersion }),
     })
   );
 }

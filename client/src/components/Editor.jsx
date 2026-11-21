@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback, useState } from 'react';
 import { useDocument }  from '../hooks/useDocument';
 import { useSocket }    from '../hooks/useSocket';
 import CursorLayer      from './CursorLayer';
+import AgentPanel       from './AgentPanel';
 
 /**
  * Editor
@@ -112,6 +113,13 @@ export default function Editor({ docId, clientId, onBack }) {
         )}
 
         <span className={`status-pill status-${status}`}>{status}</span>
+
+        <AgentPanel
+          docId={docId}
+          content={content}
+          version={version}
+          onError={(msg) => handleError({ message: msg })}
+        />
       </div>
 
       {/* Remote cursor badges */}
