@@ -4,22 +4,23 @@ import { io } from 'socket.io-client';
 const SOCKET_URL = 'http://localhost:4000';
 
 /**
- * useSocket(docId, { onInit, onOp, onCursor, onError })
+ * useSocket(docId, callbacks)
  *
- * Manages a single Socket.io connection per mount.
+ * Single Socket.io connection per docId mount.
+ * Re-joins the room on every connect event — this covers both the
+ * initial connection and any reconnects after a network blip.
+ *
  * Returns { sendOp, sendCursor, sendAgentOp }
- *
- * The socket connects once and joins the room for `docId`.
- * Cleans up on unmount or when docId changes.
  */
 export function useSocket(docId, { onInit, onOp, onCursor, onError, onAck } = {}) {
   const socketRef = useRef(null);
 
-  const onInitRef    = useRef(onInit);
-  const onOpRef      = useRef(onOp);
-  const onCursorRef  = useRef(onCursor);
-  const onErrorRef   = useRef(onError);
-  const onAckRef     = useRef(onAck);
+  // Keep callbacks in refs so socket listeners never capture stale closures
+  const onInitRef   = useRef(onInit);
+  const onOpRef     = useRef(onOp);
+  const onCursorRef = useRef(onCursor);
+  const onErrorRef  = useRef(onError);
+  const onAckRef    = useRef(onAck);
 
   useEffect(() => { onInitRef.current   = onInit;   }, [onInit]);
   useEffect(() => { onOpRef.current     = onOp;     }, [onOp]);
@@ -32,22 +33,33 @@ export function useSocket(docId, { onInit, onOp, onCursor, onError, onAck } = {}
 
     const socket = io(SOCKET_URL, {
       transports: ['websocket'],
-      reconnectionAttempts: 5,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
     });
     socketRef.current = socket;
 
+    // 'connect' fires on initial connect AND after every successful reconnect.
+    // Re-emitting join-doc on reconnect puts us back in the room and
+    // triggers a fresh doc-init so stale content is replaced.
     socket.on('connect', () => {
       socket.emit('join-doc', { docId });
     });
 
-    socket.on('doc-init', (payload) => onInitRef.current?.(payload));
-    socket.on('op',       (payload) => onOpRef.current?.(payload));
-    socket.on('op-ack',   (payload) => onAckRef.current?.(payload));
-    socket.on('cursor',   (payload) => onCursorRef.current?.(payload));
-    socket.on('error',    (payload) => onErrorRef.current?.(payload));
+    socket.on('doc-init',  (p) => onInitRef.current?.(p));
+    socket.on('op',        (p) => onOpRef.current?.(p));
+    socket.on('op-ack',    (p) => onAckRef.current?.(p));
+    socket.on('cursor',    (p) => onCursorRef.current?.(p));
+    socket.on('error',     (p) => onErrorRef.current?.(p));
+
+    socket.on('disconnect', (reason) => {
+      // If the server disconnected us (not a client-side close), show error
+      if (reason !== 'io client disconnect') {
+        onErrorRef.current?.({ message: `Disconnected: ${reason}. Reconnecting…` });
+      }
+    });
 
     socket.on('connect_error', (err) => {
-      onErrorRef.current?.({ message: `Connection failed: ${err.message}` });
+      onErrorRef.current?.({ message: `Connection error: ${err.message}` });
     });
 
     return () => {

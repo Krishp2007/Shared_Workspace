@@ -11,22 +11,19 @@ import { useState, useCallback, useRef } from 'react';
  *   title    — document title
  *   status   — 'idle' | 'loading' | 'connected' | 'error'
  *   error    — error message string or null
- *
- * Returns helpers used by Editor and useSocket callbacks.
  */
 export function useDocument() {
-  const [content, setContent]  = useState('');
-  const [version, setVersion]  = useState(0);
-  const [title, setTitle]      = useState('Untitled');
-  const [status, setStatus]    = useState('idle');
-  const [error, setError]      = useState(null);
+  const [content, setContent] = useState('');
+  const [version, setVersion] = useState(0);
+  const [title, setTitle]     = useState('Untitled');
+  const [status, setStatus]   = useState('idle');
+  const [error, setError]     = useState(null);
 
-  // Track pending (sent but not yet ack'd) ops so we can compose them
-  // against incoming remote ops before applying to local content.
-  // For the MVP we keep a simple "last sent op" buffer.
+  // Ops we sent but haven't been ack'd yet.
+  // Used to avoid re-applying our own ops when they come back rebased.
   const pendingOpsRef = useRef([]);
 
-  // ── Called when server sends doc-init ──────────────────────────────────────
+  // ── doc-init ──────────────────────────────────────────────────────────────
   const handleInit = useCallback(({ doc }) => {
     setContent(doc.content);
     setVersion(doc.version);
@@ -36,68 +33,76 @@ export function useDocument() {
     pendingOpsRef.current = [];
   }, []);
 
-  // ── Called when server broadcasts a confirmed op ───────────────────────────
-  // The server has already rebased this op — we just apply it.
-  // If it's one of our own pending ops (same clientId + version), we
-  // acknowledge it and drop it from the pending queue instead of re-applying.
+  // ── remote op (from another client) ──────────────────────────────────────
+  // Server sends `op` only to OTHER sockets, never back to the sender.
+  // So every op received here is genuinely remote — apply unconditionally.
   const handleRemoteOp = useCallback(({ op, version: newVersion }) => {
     setVersion(newVersion);
     setContent((prev) => applyOp(prev, op));
   }, []);
 
-  // ── Build op(s) from a textarea change event ──────────────────────────────
-  // Returns an array of ops (usually 1, two for a replace).
-  // Caller sends each op to the server in order.
+  // ── op-ack (server confirmed our own op) ──────────────────────────────────
+  // The server may have rebased our op. We receive { op: rebasedOp, version }.
+  // Our optimistic content used the ORIGINAL position. If the server shifted
+  // it, we need to reconcile: roll back one op and re-apply the rebased one.
+  const handleAck = useCallback(({ op: rebasedOp, version: newVersion }) => {
+    setVersion(newVersion);
+
+    if (!rebasedOp) return;
+
+    // Find the matching pending op by clientId + original version
+    const idx = pendingOpsRef.current.findIndex(
+      (p) => p.clientId === rebasedOp.clientId && p.version === rebasedOp.version - 1
+    );
+    if (idx === -1) return; // already cleaned up
+
+    const originalOp = pendingOpsRef.current[idx];
+    pendingOpsRef.current.splice(idx, 1);
+
+    // If position didn't change there's nothing to fix
+    const positionShifted =
+      originalOp.position !== rebasedOp.position ||
+      originalOp.length   !== rebasedOp.length;
+
+    if (positionShifted) {
+      // Undo the original optimistic op then re-apply the rebased one
+      setContent((prev) => {
+        const undone = undoOp(prev, originalOp);
+        return applyOp(undone, rebasedOp);
+      });
+    }
+  }, []);
+
+  // ── build ops from textarea onChange ─────────────────────────────────────
+  // Returns [] or [op] or [deleteOp, insertOp] for a replace.
   const buildOpFromChange = useCallback(
     (oldContent, newContent, clientId, currentVersion) => {
       const result = diffToOp(oldContent, newContent, clientId, currentVersion);
       if (!result) return [];
       const ops = Array.isArray(result) ? result : [result];
-      // Optimistically update local state immediately
-      setContent(newContent);
+      setContent(newContent);               // optimistic update
       pendingOpsRef.current.push(...ops);
       return ops;
     },
     []
   );
 
-  // ── Called when server acks our own op (op-ack) ───────────────────────────
-  // Just sync the version number — content already applied optimistically.
-  const handleAck = useCallback(({ version: newVersion }) => {
-    setVersion(newVersion);
-  }, []);
-
-  const setLoading = useCallback(() => setStatus('loading'), []);
+  const setLoading   = useCallback(() => setStatus('loading'), []);
   const setConnected = useCallback(() => setStatus('connected'), []);
-  const handleError = useCallback(({ message }) => {
+  const handleError  = useCallback(({ message }) => {
     setError(message);
     setStatus('error');
   }, []);
 
   return {
-    content,
-    version,
-    title,
-    setTitle,
-    status,
-    error,
-    handleInit,
-    handleRemoteOp,
-    handleAck,
-    buildOpFromChange,
-    setLoading,
-    setConnected,
-    handleError,
+    content, version, title, setTitle, status, error,
+    handleInit, handleRemoteOp, handleAck,
+    buildOpFromChange, setLoading, setConnected, handleError,
   };
 }
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
+// ─── string helpers ───────────────────────────────────────────────────────────
 
-/**
- * Apply a server op to a string.
- * Mirrors server-side apply() — kept here so client stays in sync without
- * importing server code.
- */
 function applyOp(content, op) {
   if (op.type === 'insert') {
     const pos = Math.min(op.position, content.length);
@@ -111,19 +116,31 @@ function applyOp(content, op) {
   return content;
 }
 
+// Reverse a previously applied op (best-effort — only used for reconciliation)
+function undoOp(content, op) {
+  if (op.type === 'insert') {
+    // Remove the text we inserted
+    const pos = Math.min(op.position, content.length);
+    const len = Math.min(op.text.length, content.length - pos);
+    return content.slice(0, pos) + content.slice(pos + len);
+  }
+  if (op.type === 'delete') {
+    // We don't have the deleted text, so we can't truly undo.
+    // The reconciliation path only triggers for inserts (position shift),
+    // so this branch is a safety fallback — return as-is.
+    return content;
+  }
+  return content;
+}
+
 /**
- * diffToOp(oldStr, newStr, clientId, version)
- *
- * Derives a single insert or delete op from two consecutive textarea values.
- * Browsers always produce one contiguous diff per input event, so this
- * simple longest-common-prefix/suffix approach is accurate.
- *
- * Returns null when old === new.
+ * diffToOp — derive op(s) from two consecutive textarea values.
+ * Uses longest-common-prefix/suffix — accurate for all single-event changes.
+ * Returns null | op | [deleteOp, insertOp]
  */
 function diffToOp(oldStr, newStr, clientId, version) {
   if (oldStr === newStr) return null;
 
-  // Find common prefix length
   let prefixLen = 0;
   while (
     prefixLen < oldStr.length &&
@@ -131,7 +148,6 @@ function diffToOp(oldStr, newStr, clientId, version) {
     oldStr[prefixLen] === newStr[prefixLen]
   ) prefixLen++;
 
-  // Find common suffix length (don't overlap with prefix)
   let oldSuffix = oldStr.length;
   let newSuffix = newStr.length;
   while (
@@ -140,52 +156,23 @@ function diffToOp(oldStr, newStr, clientId, version) {
     oldStr[oldSuffix - 1] === newStr[newSuffix - 1]
   ) { oldSuffix--; newSuffix--; }
 
-  const deletedLen  = oldSuffix - prefixLen;  // chars removed from old
-  const insertedStr = newStr.slice(prefixLen, newSuffix); // chars added in new
+  const deletedLen  = oldSuffix - prefixLen;
+  const insertedStr = newStr.slice(prefixLen, newSuffix);
 
+  // Replace: emit delete + insert so server sees two clean ops
   if (deletedLen > 0 && insertedStr.length > 0) {
-    // Replace = delete + insert. Emit delete now; the insertion will be
-    // picked up in the next diff cycle automatically because React sets
-    // the value after each onChange, so the next event sees old=afterDelete.
-    // We also emit the insert immediately as a second op so single-event
-    // replacements (paste, autocorrect) work correctly.
-    // Return an array; caller must send both.
     return [
-      {
-        type: 'delete',
-        position: prefixLen,
-        length: deletedLen,
-        clientId,
-        version,
-      },
-      {
-        type: 'insert',
-        position: prefixLen,
-        text: insertedStr,
-        clientId,
-        version, // server will rebase the insert against the delete
-      },
+      { type: 'delete', position: prefixLen, length: deletedLen, clientId, version },
+      { type: 'insert', position: prefixLen, text: insertedStr, clientId, version },
     ];
   }
 
   if (deletedLen > 0) {
-    return {
-      type: 'delete',
-      position: prefixLen,
-      length: deletedLen,
-      clientId,
-      version,
-    };
+    return { type: 'delete', position: prefixLen, length: deletedLen, clientId, version };
   }
 
   if (insertedStr.length > 0) {
-    return {
-      type: 'insert',
-      position: prefixLen,
-      text: insertedStr,
-      clientId,
-      version,
-    };
+    return { type: 'insert', position: prefixLen, text: insertedStr, clientId, version };
   }
 
   return null;

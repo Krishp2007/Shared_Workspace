@@ -33,9 +33,11 @@ module.exports = function attachDocHandler(io) {
         const docId = sanitizeId(payload?.docId);
         if (!docId) return socket.emit('error', { message: 'Invalid docId.' });
 
-        let doc = await Document.findById(docId).select('-history'); // don't send history to client
+        // findById without history; create if not found then load it clean
+        let doc = await Document.findById(docId).select('-history');
         if (!doc) {
-          doc = await Document.create({ _id: docId });
+          await Document.create({ _id: docId });
+          doc = await Document.findById(docId).select('-history');
         }
 
         if (socket.currentDocId) socket.leave(socket.currentDocId);
@@ -102,10 +104,10 @@ module.exports = function attachDocHandler(io) {
         await Document.findByIdAndUpdate(docId, updateOp);
 
         // Broadcast to everyone in the room EXCEPT the sender.
-        // The sender already applied the op optimistically on their side.
         socket.to(docId).emit('op', { op: rebased, version: newVersion });
-        // Send ack back to sender so they can update their local version number.
-        socket.emit('op-ack', { version: newVersion });
+        // Ack to sender: include the rebased op so client can reconcile
+        // if the server shifted the position.
+        socket.emit('op-ack', { op: rebased, version: newVersion });
 
         console.log(`[op] doc=${docId} v${newVersion} ${rebased.type}@${rebased.position}`);
       } catch (err) {
