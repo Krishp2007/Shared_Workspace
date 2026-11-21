@@ -7,6 +7,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 
 const attachDocHandler = require('./socket/docHandler');
+const docsRouter = require('./routes/docs');
 
 // ─── CORS origin from env ─────────────────────────────────────────────────────
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
@@ -35,6 +36,9 @@ app.use(
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+// ── API routes ────────────────────────────────────────────────────────────────
+app.use('/docs', docsRouter);
+
 // ── HTTP + Socket.io server ───────────────────────────────────────────────────
 const httpServer = http.createServer(app);
 
@@ -45,6 +49,9 @@ const io = new Server(httpServer, {
 });
 
 attachDocHandler(io);
+
+// Expose io to route handlers (agent-rewrite broadcasts over socket)
+app.set('io', io);
 
 // ── MongoDB ───────────────────────────────────────────────────────────────────
 mongoose
